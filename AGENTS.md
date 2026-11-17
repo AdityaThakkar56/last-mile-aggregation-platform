@@ -6,7 +6,7 @@
 
 > [!IMPORTANT]
 > **MANDATORY READING FOR ALL AI ASSISTANTS AND CODING AGENTS:**
-> You must read and strictly adhere to the architecture specifications located in `docs/` before generating code, scaffolding projects, creating database migrations, or proposing technical modifications. The decisions in `docs/` take absolute precedence over generic coding conventions or outside defaults.
+> You must read and strictly adhere to the authoritative architecture specifications located in `docs/` before generating code, scaffolding projects, creating database migrations, or proposing technical modifications. The decisions in `docs/` take absolute precedence over generic coding conventions or outside defaults.
 
 ---
 
@@ -20,7 +20,7 @@
 2. **PostgreSQL + PostGIS is the Sole Authoritative Truth:**
    - PostgreSQL 16+ is the single source of truth for all bookings, ride groups, driver assignments, financial ledgers, and user accounts.
    - **Redis is strictly an ephemeral cache** for volatile driver GPS fixes (30s TTL) and a broker for BullMQ job queues.
-   - Never treat Redis, in-memory Node.js Maps, or Socket.IO state as authoritative. If Redis is flushed, PostgreSQL must retain 100% data integrity.
+   - Never treat Redis, in-memory Node.js Maps, or Socket.IO state as authoritative. If Redis is flushed (`FLUSHALL`), PostgreSQL must retain 100% data integrity.
 
 3. **Backend Authorization is Absolute (Zero Frontend Trust):**
    - The client application mode selection ("Passenger" or "Driver" in Flutter) is strictly a user interface state, NOT a security boundary.
@@ -38,7 +38,7 @@
    - **Never hold database transactions open** while awaiting external HTTP calls (OSRM), Socket.IO broadcasts, or user input.
 
 5. **Mandatory Idempotency for All State Mutations:**
-   - All state-mutating REST endpoints (booking creation, ride cancellations, driver acceptance) must accept and enforce an `Idempotency-Key` header verified against `idempotency_records`.
+   - All state-mutating REST endpoints (booking creation, ride cancellations, driver acceptance, cash confirmation) must accept and enforce an `Idempotency-Key` header verified against `idempotency_records`.
    - All BullMQ background job consumers must be strictly idempotent: they must query the authoritative PostgreSQL row by UUID and verify current state before executing mutations.
 
 ---
@@ -54,7 +54,7 @@
 ### 2.2 Removal of Group Fingerprint Exclusion Tables
 - **DO NOT create a dedicated `matching_group_attempts` or `group_fingerprint` table in the MVP database.**
 - Because passenger acceptance voting has been eliminated, the loop where passengers repeatedly reject the same group is gone.
-- Operational traceability is maintained through standard tables: `matching_batches`, `batch_bookings`, `ride_groups`, `group_members`, and `driver_dispatch_offers`.
+- Operational traceability is maintained through standard tables: `matching_batches`, `matching_batch_bookings`, `ride_groups`, `group_members`, and `driver_dispatch_offers`.
 
 ### 2.3 Driver Dispatch and Multi-Offer Rules
 - **Strict 1-to-1 Group Dispatch:** A ride group is offered to **EXACTLY ONE driver at a time** with a 20-second timeout. Never broadcast a group to multiple drivers concurrently.
@@ -67,10 +67,23 @@
   - The group cascades immediately to the next ranked eligible driver.
   - If the group configuration changes (e.g., a member cancels), the group version increments, and the driver becomes eligible again.
 
-### 2.4 Cancellation and Late Fee Rules
+### 2.4 Cancellation, Waiting Charges and Fee Recovery Rules
 - **Cancellation Before Driver Assignment:** Free cancellation (₹0 fee). The remaining group is recalculated: if $\ge 2$ passengers and detour $\le 25\%$, the group is preserved; otherwise, it is dissolved and compliant members are rematched, **strictly preserving their original booking creation timestamps**.
-- **Cancellation After Driver Assignment:** Assesses a **fixed ₹30 late cancellation fee** inserted into `cancellation_fees` as `OUTSTANDING`. Exempt driver inactivity $> 5\text{m}$, platform errors, and administrative waivers.
+- **Cancellation After Driver Assignment:** Assesses a **fixed ₹30 late cancellation fee** inserted into `cancellation_fees` as `'OUTSTANDING'`. Exempt driver inactivity $> 5\text{m}$, platform errors, and administrative waivers.
+- **Waiting Charges:** First 5 minutes free; ₹5 per started minute thereafter ($W_i = 5 \times \lceil\max(0, T_i - 5)\rceil$) up to 10 minutes. Kept strictly individual; never included in shared group fare.
+- **No-Show Policy:** Unboarded after 10 minutes $\rightarrow$ `NO_SHOW`, flat ₹30 penalty. **Zero additional waiting charge.**
 - **Cash-Only Recovery on Next Ride:** Surcharge outstanding fees on the passenger's subsequent ride. Collect and mark `COLLECTED` atomically when the driver confirms cash receipt. **A cancellation fee must never be collected twice.**
+
+### 2.5 Driver Breakdown and Mid-Trip Failure Rules
+- **Incident Interruption:** Trip marked `'INTERRUPTED'`. Immutable passenger manifest captured in `trip_incidents`.
+- **Replacement Search:** Searches available approved drivers ranked by OSRM travel time to incident location.
+- **Replacement Resumption:** Trip returns to `'IN_PROGRESS'` (`trip.resumed` is an event, NOT a persistent state). Onboard passengers receive an automatic **10% discount** on final fare.
+- **Replacement Failure:** If no driver available, trip marked `'ABORTED'`. Onboard passengers pay **₹0.00**. Full cash refund issued if cash collected. Platform absorbs cost.
+
+### 2.6 Shared Early Drop-Off Policy
+- Shared ride passengers cannot alter destination en route.
+- Early drop-off is permitted only at an on-route safe point. Driver confirms. Passenger marked `'COMPLETED'`.
+- **The original allocated fare remains completely unchanged.** Other passengers' fares and route geometry remain untouched.
 
 ---
 
@@ -78,28 +91,28 @@
 
 When generating Prisma migrations or executing raw SQL queries, you must guarantee the following 11 database invariants:
 
-1. **One Active Booking per Passenger:** Enforced via partial unique index:
+1. **One Active Booking per Passenger:**
    `CREATE UNIQUE INDEX idx_unique_active_passenger_booking ON bookings (passenger_id) WHERE status IN ('REQUESTED', 'MATCHING', 'DISPATCHING', 'CONFIRMED', 'IN_PROGRESS');`
-2. **One Active Group Membership per Booking:** A booking belongs to at most one active group:
+2. **One Active Group Membership per Booking:**
    `CREATE UNIQUE INDEX idx_unique_active_booking_in_group ON group_members (booking_id) WHERE is_active_member = true;`
-3. **One Active Assignment per Driver:** Enforced via partial unique index:
-   `CREATE UNIQUE INDEX idx_unique_active_driver_assignment ON ride_assignments (driver_id) WHERE status IN ('ASSIGNED', 'ARRIVED', 'IN_PROGRESS');`
-4. **One Active Assignment per Group:** Enforced via partial unique index:
-   `CREATE UNIQUE INDEX idx_unique_active_group_assignment ON ride_assignments (ride_group_id) WHERE status IN ('ASSIGNED', 'ARRIVED', 'IN_PROGRESS');`
-5. **Single Pending Offer per Group:** A group has at most one pending driver offer:
+3. **One Active Assignment per Driver:**
+   `CREATE UNIQUE INDEX idx_unique_active_driver_assignment ON driver_assignments (driver_id) WHERE status IN ('RESERVED', 'ACTIVE');`
+4. **One Active Assignment per Group:**
+   `CREATE UNIQUE INDEX idx_unique_active_group_assignment ON driver_assignments (ride_group_id) WHERE status IN ('RESERVED', 'ACTIVE');`
+5. **Single Pending Offer per Group:**
    `CREATE UNIQUE INDEX idx_unique_single_pending_offer_per_group ON driver_dispatch_offers (ride_group_id) WHERE status = 'PENDING';`
-6. **Scoped Driver Offer Exclusion:** Scoped to group version and dispatch attempt:
+6. **Scoped Driver Offer Exclusion:**
    `CREATE UNIQUE INDEX idx_unique_driver_offer_per_group_version ON driver_dispatch_offers (ride_group_id, group_version, dispatch_attempt_id, driver_id);`
-7. **No Duplicate Fee Collection:** A cancellation fee can only be settled once:
+7. **No Duplicate Fee Collection:**
    `CREATE UNIQUE INDEX idx_unique_collected_booking_fee ON cancellation_fees (collected_booking_id) WHERE status = 'COLLECTED';`
 8. **Group Capacity Limits:** A shared group must maintain between 2 and 4 passengers while active for dispatch.
 9. **Ownership Protection:** A passenger can never cancel or query another passenger's booking.
 10. **Driver Eligibility:** Only administrator-approved (`verification_status = 'APPROVED'`), online (`is_online = true`), unsuspended drivers can receive or accept offers.
-11. **PostGIS Geofencing:** Pickup coordinates must fall within 150m of the PDEU zone center; drop-off coordinates must reside strictly within the Gandhinagar service region polygon.
+11. **PostGIS Geofencing:** Pickup coordinates must fall within 150m of PDEU zone center; drop-off coordinates must reside strictly within the Gandhinagar service region polygon.
 
 ---
 
-## 4. Environment and Financial Guardrails
+## 4. Environment and Mobile Development Guardrails
 
 1. **Strict ₹0 Budget Constraint:**
    - Do not integrate paid third-party APIs (Google Directions, Mapbox SDK, Twilio, SendGrid, Stripe, Razorpay).
@@ -109,10 +122,12 @@ When generating Prisma migrations or executing raw SQL queries, you must guarant
    - Keep all credentials, database passwords, and secrets inside local `.env` files (ignored by Git). Commit `.env.example` placeholders only.
 3. **No Premature DevOps / CI/CD:**
    - Do not add GitHub Actions CI/CD workflows, Docker Compose requirements, or Kubernetes manifests to the MVP deliverable.
-4. **Do Not Fabricate Pending Decisions:**
-   - Do not hardcode assumed values for items listed as **PENDING** in [docs/ARCHITECTURE_DECISIONS.md](./docs/ARCHITECTURE_DECISIONS.md) (such as exact base fare tariffs, exact material change thresholds, or final token lifespans). Prompt the user or mark them as configurable parameters.
+4. **Mobile Target Priority:**
+   - Both Android and iOS are official project targets.
+   - Current development priority: VS Code / Antigravity IDE with Xcode and the iOS Simulator as the primary initial development/testing environment, alongside physical iPhone validation. Android Studio and Emulator are configured in Phase 2.
+5. **Stage 9 Dependency Lock:**
+   - **Do not begin Stage 9 (Breakdown Management & Replacement Dispatch) implementation planning until Stages 1 through 8 have passed all verification gates.**
 
 ---
 
 *Adhere to these instructions strictly across all implementation tasks.*
-
