@@ -1,0 +1,572 @@
+# REST and Realtime API Specification
+
+## On-Demand Aggregation Platform for Last-Mile Connectivity Using Shared Micro-Mobility
+
+---
+
+## 1. Global API Conventions
+
+### 1.1 Transport and Addressing
+- **Base Protocol:** HTTPS for REST, WSS for WebSockets.
+- **REST Base Path:** `/api/v1`
+- **Realtime Gateway:** `/realtime` (Socket.IO namespace `/`)
+- **Payload Format:** Strict JSON (`application/json; charset=utf-8`).
+- **Identifiers:** Canonical UUIDv4 strings.
+- **Timestamps:** ISO 8601 UTC strings with millisecond precision (`YYYY-MM-DDTHH:mm:ss.sssZ`).
+- **Spatial Coordinates:** WGS 84 (SRID 4326) `{ "latitude": float, "longitude": float }`.
+- **Monetary Representations:** Stored internally in integer **paise**; REST APIs return formatted rupee decimal strings (e.g., `"45.00"` representing ₹45.00) alongside raw integer paise fields (`4500`).
+
+### 1.2 Authentication and Idempotency Headers
+All secured endpoints require an HTTP `Authorization` Bearer token:
+```http
+Authorization: Bearer <jwt-access-token>
+```
+Mutating operations sensitive to network retries (booking creation, cancellations, offer acceptances, cash confirmations) enforce the `Idempotency-Key` header:
+```http
+Idempotency-Key: <unique-uuid-or-client-nonce>
+```
+
+### 1.3 Standard Response Envelopes
+
+**Success Envelope (HTTP 200 / 201):**
+```json
+{
+  "success": true,
+  "statusCode": 200,
+  "message": "Operation completed successfully",
+  "data": {},
+  "timestamp": "2026-11-17T12:00:00.000Z"
+}
+```
+
+**Error Envelope (HTTP 4xx / 5xx):**
+```json
+{
+  "success": false,
+  "statusCode": 409,
+  "errorCode": "BOOKING_ALREADY_ACTIVE",
+  "message": "Passenger already has an active booking in progress.",
+  "errors": [],
+  "timestamp": "2026-11-17T12:00:00.000Z",
+  "path": "/api/v1/bookings"
+}
+```
+
+---
+
+## 2. Standard Error Codes Catalogue
+
+| Error Code | HTTP Status | Meaning & Cause |
+|---|---|---|
+| `UNAUTHORIZED` | 401 | Missing, malformed, or expired JWT access token. |
+| `FORBIDDEN` | 403 | Insufficient RBAC role or unapproved driver attempting privileged action. |
+| `BOOKING_ALREADY_ACTIVE` | 409 | Passenger already possesses an active booking (`REQUESTED`, `MATCHING`, `DISPATCHING`, `CONFIRMED`, `IN_PROGRESS`). |
+| `QUOTE_EXPIRED` | 400 | Fare quote exceeds its 2-minute validity window. |
+| `PICKUP_OUTSIDE_GEOFENCE` | 400 | Pickup coordinate is $> 150\text{m}$ from the PDEU zone center. |
+| `DESTINATION_OUTSIDE_SERVICE_AREA`| 400 | Destination coordinate lies outside the Gandhinagar service polygon. |
+| `FARE_CEILING_EXCEEDED` | 422 | Calculated shared fare exceeds the passenger's agreed fare ceiling. |
+| `OFFER_EXPIRED` | 410 | Driver dispatch offer exceeded its 20-second timeout window. |
+| `OFFER_ALREADY_TAKEN` | 409 | Driver or group has already been reserved by a competing concurrent acceptance. |
+| `INVALID_GROUP_VERSION` | 409 | Attempting an action on an obsolete group version after a member cancellation. |
+| `INVALID_OTP` | 400 | Boarding OTP hash does not match or max attempts exceeded. |
+| `NO_SHOW_DEADLINE_NOT_REACHED` | 400 | Driver attempting to declare no-show before the 10-minute waiting window elapses. |
+| `TRIP_ALREADY_COMPLETED` | 409 | Mutating a trip that has already been finalized or aborted. |
+| `INSUFFICIENT_VEHICLE_CAPACITY` | 422 | Replacement driver vehicle does not possess enough seats for onboard passengers. |
+| `SERVICE_UNAVAILABLE` | 503 | Database or local OSRM routing engine unreachable. |
+
+---
+
+## 3. Comprehensive REST Endpoint Specifications
+
+### Area 1: Authentication and Session Security
+
+#### 1.1 Authenticate with Google
+- **Method & Path:** `POST /api/v1/auth/google`
+- **Auth:** Public
+- **Request Body:**
+  ```json
+  { "idToken": "eyJhbGciOiJSUzI1NiIs..." }
+  ```
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "data": {
+      "user": { "id": "uuid", "email": "aarav@pdeu.ac.in", "role": "PASSENGER" },
+      "accessToken": "jwt-access-token",
+      "refreshToken": "opaque-refresh-token",
+      "expiresIn": 900
+    }
+  }
+```
+- **Validation:** Verifies Google signature, `aud`, `iss`, and expiration against Google JWKS.
+- **Side Effects:** Inserts/updates `users`, `auth_identities`, and `user_sessions`.
+
+#### 1.2 Rotate Refresh Token
+- **Method & Path:** `POST /api/v1/auth/refresh`
+- **Auth:** Public
+- **Request Body:** `{ "refreshToken": "opaque-refresh-token" }`
+- **Response (200 OK):** Issues new access token (15m) and rotated refresh token (30d max). Revokes token family on reuse.
+
+#### 1.3 Terminate Session (Logout)
+- **Method & Path:** `POST /api/v1/auth/logout`
+- **Auth:** Bearer Token
+- **Side Effects:** Marks session `revoked_at = NOW()`.
+
+#### 1.4 Terminate All Sessions
+- **Method & Path:** `POST /api/v1/auth/logout-all`
+- **Auth:** Bearer Token
+- **Side Effects:** Revokes all sessions belonging to the user UUID.
+
+#### 1.5 Generate Short-Lived Socket Ticket
+- **Method & Path:** `GET /api/v1/auth/socket-ticket`
+- **Auth:** Bearer Token
+- **Response (200 OK):**
+  ```json
+  { "success": true, "data": { "ticket": "single-use-uuid", "expiresIn": 60 } }
+  ```
+
+---
+
+### Area 2: User and Passenger Profiles
+
+#### 2.1 Get Current User Profile
+- **Method & Path:** `GET /api/v1/users/me`
+- **Auth:** Bearer Token (Any Role)
+- **Response (200 OK):** Returns user details, active role, passenger profile, and outstanding cancellation fees.
+
+#### 2.2 Update Profile Preferences
+- **Method & Path:** `PATCH /api/v1/users/me`
+- **Auth:** Bearer Token (Any Role)
+- **Request Body:** `{ "defaultMinGroupPreference": 3 }`
+
+---
+
+### Area 3: Driver Onboarding and Administration
+
+#### 3.1 Submit Driver Onboarding Application
+- **Method & Path:** `POST /api/v1/drivers/onboard`
+- **Auth:** Bearer Token (`PASSENGER` upgrading to `DRIVER`)
+- **Request Body:**
+  ```json
+  {
+    "licenseNumber": "GJ-01-2023-0012345",
+    "vehicle": {
+      "registrationNumber": "GJ-01-AA-1234",
+      "vehicleType": "E_RICKSHAW",
+      "passengerCapacity": 4,
+      "makeModel": "Mahindra Treo"
+    }
+  }
+  ```
+- **State Transition:** Creates `driver_profiles` with `verification_status = 'PENDING'`.
+
+#### 3.2 Upload Driver Documents
+- **Method & Path:** `POST /api/v1/drivers/documents`
+- **Auth:** Bearer Token (`DRIVER`)
+- **Request Body:** `{ "documentType": "DRIVING_LICENSE", "documentUrl": "/uploads/lic_123.pdf" }`
+
+#### 3.3 Admin: List Pending Drivers
+- **Method & Path:** `GET /api/v1/admin/drivers/pending`
+- **Auth:** Bearer Token (`ADMIN`)
+
+#### 3.4 Admin: Approve Driver
+- **Method & Path:** `POST /api/v1/admin/drivers/:id/approve`
+- **Auth:** Bearer Token (`ADMIN`)
+- **State Transition:** `verification_status` $\rightarrow$ `'APPROVED'`. Emits `admin.driver.approved`.
+
+#### 3.5 Admin: Reject Driver
+- **Method & Path:** `POST /api/v1/admin/drivers/:id/reject`
+- **Auth:** Bearer Token (`ADMIN`)
+- **Request Body:** `{ "rejectionReason": "Blurry driving license image." }`
+
+---
+
+### Area 4: Vehicle Management
+
+#### 4.1 Register Additional Vehicle
+- **Method & Path:** `POST /api/v1/drivers/vehicles`
+- **Auth:** Bearer Token (`DRIVER`)
+
+#### 4.2 List Driver Vehicles
+- **Method & Path:** `GET /api/v1/drivers/vehicles`
+- **Auth:** Bearer Token (`DRIVER`)
+
+---
+
+### Area 5: Service Zones and Pickup Points
+
+#### 5.1 List Authorized Pickup Points
+- **Method & Path:** `GET /api/v1/locations/pickup-zones`
+- **Auth:** Public / Bearer Token
+- **Response (200 OK):** Returns active pickup points with PostGIS coordinates and geofence radii.
+
+#### 5.2 Get Service Region Polygon
+- **Method & Path:** `GET /api/v1/locations/service-regions`
+- **Auth:** Public / Bearer Token
+- **Response (200 OK):** GeoJSON Polygon of Gandhinagar service area.
+
+---
+
+### Area 6: Location Geofence Validation
+
+#### 6.1 Validate Pickup Geofence
+- **Method & Path:** `POST /api/v1/locations/validate-pickup`
+- **Auth:** Bearer Token
+- **Request Body:** `{ "pickupPointId": "uuid", "latitude": 23.1550, "longitude": 72.6668 }`
+- **Validation:** Executes PostGIS `ST_DWithin(center_point, ST_MakePoint(lng, lat), radius_meters)`.
+
+#### 6.2 Validate Destination Polygon
+- **Method & Path:** `POST /api/v1/locations/validate-destination`
+- **Auth:** Bearer Token
+- **Validation:** Executes PostGIS `ST_Contains(boundary_polygon, ST_MakePoint(lng, lat))`.
+
+---
+
+### Area 7: Fare Quotes and Ceilings
+
+#### 7.1 Generate Fare Quote
+- **Method & Path:** `POST /api/v1/fares/quotes`
+- **Auth:** Bearer Token (`PASSENGER`)
+- **Request Body:**
+  ```json
+  {
+    "pickupPointId": "uuid",
+    "destination": { "latitude": 23.1812, "longitude": 72.6345 }
+  }
+  ```
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "data": {
+      "quoteId": "quote-uuid",
+      "directDistanceMeters": 4200,
+      "directDurationSec": 540,
+      "privateEstimatedFare": "62.00",
+      "sharedEstimatedRange": {
+        "minFare": "20.00",
+        "maxFare": "62.00"
+      },
+      "agreedFareCeiling": "62.00",
+      "tariffVersion": 1,
+      "expiresAt": "2026-11-17T12:02:00.000Z"
+    }
+  }
+  ```
+- **Behavior:** Calls OSRM Table/Route for direct road distance. Returns 2-minute valid quote.
+
+---
+
+### Area 8: Bookings and Upfront Consent
+
+#### 8.1 Create Booking (Upfront Consent)
+- **Method & Path:** `POST /api/v1/bookings`
+- **Auth:** Bearer Token (`PASSENGER`)
+- **Headers:** `Idempotency-Key: <uuid>` (Mandatory)
+- **Request Body:**
+  ```json
+  {
+    "quoteId": "quote-uuid",
+    "requestedType": "SHARED",
+    "minGroupPreference": 2,
+    "passengerPickupLocation": { "latitude": 23.1550, "longitude": 72.6668 },
+    "upfrontConsentAgreed": true
+  }
+  ```
+- **Response (201 Created):**
+  ```json
+  {
+    "success": true,
+    "data": {
+      "bookingId": "booking-uuid",
+      "status": "REQUESTED",
+      "maxWaitDeadline": "2026-11-17T12:04:00.000Z",
+      "agreedFareCeiling": "62.00"
+    }
+  }
+  ```
+- **Invariants Enforced:** Exactly one active booking per passenger. Validates 150m geofence and quote expiry. Inserts `outbox_events` (`BOOKING_CREATED`).
+
+#### 8.2 Get Booking Details
+- **Method & Path:** `GET /api/v1/bookings/:id`
+- **Auth:** Bearer Token (Booking Owner or Assigned Driver)
+
+#### 8.3 Cancel Booking
+- **Method & Path:** `POST /api/v1/bookings/:id/cancel`
+- **Auth:** Bearer Token (Booking Owner)
+- **Headers:** `Idempotency-Key: <uuid>`
+- **Request Body:** `{ "reason": "Change of plans" }`
+- **Response (200 OK):**
+  - *If before driver assignment:* Status $\rightarrow$ `CANCELLED`. Fee assessed = ₹0. Group recalculated.
+  - *If after driver assignment:* Status $\rightarrow$ `CANCELLED`. Late fee assessed = ₹30 (inserted into `cancellation_fees`). Driver notified.
+
+---
+
+### Area 9: Matching and Group Status
+
+#### 9.1 Get Booking Group Status
+- **Method & Path:** `GET /api/v1/bookings/:id/group`
+- **Auth:** Bearer Token (Booking Owner)
+- **Response (200 OK):** Returns group version, members count, assigned driver ETA, and allocated fare.
+
+---
+
+### Area 10: Driver Online Availability
+
+#### 10.1 Update Driver Operational Status
+- **Method & Path:** `PATCH /api/v1/drivers/status`
+- **Auth:** Bearer Token (`DRIVER`, `verification_status = 'APPROVED'`)
+- **Request Body:** `{ "isOnline": true }`
+- **State Transition:** If true, sets `operational_status = 'AVAILABLE'`; if false and no active trip, sets `'OFFLINE'`.
+
+---
+
+### Area 11: Driver Dispatch Offers and Acceptance
+
+#### 11.1 List Pending Offers for Driver
+- **Method & Path:** `GET /api/v1/drivers/offers/pending`
+- **Auth:** Bearer Token (`DRIVER`)
+- **Response (200 OK):** Returns array of pending dispatch offers for that driver with remaining countdown timers.
+
+#### 11.2 Accept Dispatch Offer (Atomic Reservation)
+- **Method & Path:** `POST /api/v1/drivers/offers/:id/accept`
+- **Auth:** Bearer Token (`DRIVER`)
+- **Headers:** `Idempotency-Key: <uuid>` (Mandatory)
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "data": {
+      "assignmentId": "assign-uuid",
+      "tripId": "trip-uuid",
+      "rideGroupId": "group-uuid",
+      "passengerCount": 3,
+      "totalEstimatedFare": "114.00",
+      "navigationRoute": { "geometry": "GeoJSON...", "stops": [] }
+    }
+  }
+  ```
+- **Concurrency & Locking:** Inside a PostgreSQL transaction, executes `SELECT ... FOR UPDATE` on `ride_groups` and conditional CAS on `driver_profiles` (`WHERE operational_status = 'AVAILABLE'`). Sets offer `ACCEPTED`, driver `RESERVED`, marks competing offers `WITHDRAWN`.
+
+#### 11.3 Reject Dispatch Offer
+- **Method & Path:** `POST /api/v1/drivers/offers/:id/reject`
+- **Auth:** Bearer Token (`DRIVER`)
+- **Request Body:** `{ "reason": "Too far from pickup hub" }`
+- **State Transition:** Sets offer `REJECTED`. Driver is excluded strictly for that group version. Group cascades immediately to the next ranked driver.
+
+---
+
+### Area 12: Driver GPS Telemetry (REST Fallback)
+
+#### 12.1 Ingest Driver GPS Fix
+- **Method & Path:** `POST /api/v1/drivers/location`
+- **Auth:** Bearer Token (`DRIVER`)
+- **Request Body:**
+  ```json
+  {
+    "latitude": 23.1555,
+    "longitude": 72.6670,
+    "heading": 180.5,
+    "speed": 6.2
+  }
+  ```
+- **Behavior:** Updates Redis cache (TTL 30s) and broadcasts to active trip room.
+
+---
+
+### Area 13: Driver Arrival at Pickup Hub
+
+#### 13.1 Driver Reports Arrival
+- **Method & Path:** `POST /api/v1/trips/:id/arrive-pickup`
+- **Auth:** Bearer Token (Assigned Driver)
+- **State Transition:** Sets trip status `'AT_PICKUP'`, records `driver_arrived_at = NOW()`. Starts individual 5-minute free waiting timer. Emits `trip.driver_arrived`.
+
+---
+
+### Area 14: Boarding Verification (OTP)
+
+#### 14.1 Verify Passenger Boarding OTP
+- **Method & Path:** `POST /api/v1/trips/:id/verify-boarding`
+- **Auth:** Bearer Token (Assigned Driver)
+- **Request Body:** `{ "passengerId": "uuid", "otp": "4821" }`
+- **Response (200 OK):**
+  ```json
+  { "success": true, "message": "Passenger boarding verified", "data": { "passengerStatus": "BOARDED" } }
+  ```
+- **Validation:** Matches SHA-256 hash. Enforces 3 maximum attempts. Authoritative for stopping waiting charge timer.
+
+---
+
+### Area 15: Trip Start and Completion
+
+#### 15.1 Start Trip
+- **Method & Path:** `POST /api/v1/trips/:id/start`
+- **Auth:** Bearer Token (Assigned Driver)
+- **Validation:** All non-cancelled passengers must be `BOARDED`. Sets trip status `'IN_PROGRESS'`.
+
+#### 15.2 Finalize Vehicle Trip
+- **Method & Path:** `POST /api/v1/trips/:id/complete`
+- **Auth:** Bearer Token (Assigned Driver)
+- **Validation:** All passenger journeys must be finalized (`COMPLETED` or `NO_SHOW`). Sets trip `'COMPLETED'`, driver `'AVAILABLE'`.
+
+---
+
+### Area 16: Individual Passenger Drop-Off Completion
+
+#### 16.1 Complete Individual Drop-Off
+- **Method & Path:** `POST /api/v1/trips/:id/passengers/:passengerId/complete`
+- **Auth:** Bearer Token (Assigned Driver)
+- **Response (200 OK):**
+  ```json
+  {
+    "success": true,
+    "data": {
+      "passengerId": "uuid",
+      "rideFare": "38.00",
+      "waitingCharge": "0.00",
+      "outstandingLateFeeSurcharge": "30.00",
+      "totalCashToCollect": "68.00"
+    }
+  }
+  ```
+- **State Transition:** Marks `trip_passengers` status `'COMPLETED'`. Computes exact cash to collect including outstanding fee surcharge.
+
+---
+
+### Area 17: Destination Alteration (Private Ride Only)
+
+#### 17.1 Request Private Destination Change
+- **Method & Path:** `POST /api/v1/bookings/:id/change-destination`
+- **Auth:** Bearer Token (Booking Owner, Private Ride Only)
+- **Request Body:** `{ "newDestination": { "latitude": 23.1900, "longitude": 72.6200 } }`
+- **Response (200 OK):** Recalculates route and shows updated fare quote.
+
+#### 17.2 Confirm Destination Change
+- **Method & Path:** `POST /api/v1/bookings/:id/confirm-destination-change`
+- **Auth:** Bearer Token (Booking Owner)
+- **State Transition:** Updates destination and fare ceiling.
+
+---
+
+### Area 18: Passenger No-Show Declaration
+
+#### 18.1 Declare Passenger No-Show
+- **Method & Path:** `POST /api/v1/trips/:id/passengers/:passengerId/no-show`
+- **Auth:** Bearer Token (Assigned Driver)
+- **Validation:** Must be $\ge 10\text{ minutes}$ since `driver_arrived_at`.
+- **State Transition:** Sets passenger status `'NO_SHOW'`, assesses flat ₹30 fee into `cancellation_fees` as `'OUTSTANDING'`. Charges ₹0 waiting fee.
+
+---
+
+### Area 19: Physical Cash Confirmation
+
+#### 19.1 Confirm Cash Receipt
+- **Method & Path:** `POST /api/v1/payments/confirm-cash`
+- **Auth:** Bearer Token (Assigned Driver)
+- **Headers:** `Idempotency-Key: <uuid>` (Mandatory)
+- **Request Body:**
+  ```json
+  {
+    "tripId": "trip-uuid",
+    "tripPassengerId": "passenger-uuid",
+    "amountCollectedPaise": 6800
+  }
+  ```
+- **State Transition:** Inserts `cash_collections` and `payment_allocations`. If outstanding cancellation fee was surcharged, atomically marks fee `'COLLECTED'`.
+
+---
+
+### Area 20: Outstanding Cancellation Fees
+
+#### 20.1 Query Passenger Outstanding Fees
+- **Method & Path:** `GET /api/v1/passengers/cancellation-fees/outstanding`
+- **Auth:** Bearer Token (`PASSENGER`)
+
+#### 20.2 Admin: Waive Cancellation Fee
+- **Method & Path:** `POST /api/v1/admin/cancellation-fees/:id/waive`
+- **Auth:** Bearer Token (`ADMIN`)
+- **Request Body:** `{ "waiverReason": "Verified campus medical emergency" }`
+- **State Transition:** Sets fee status `'WAIVED'`, logs action in `admin_audit_logs`.
+
+---
+
+### Area 21: Driver Breakdown Reporting
+
+#### 21.1 Report Driver Breakdown
+- **Method & Path:** `POST /api/v1/trips/:id/report-breakdown`
+- **Auth:** Bearer Token (Assigned Driver or Admin)
+- **Request Body:**
+  ```json
+  {
+    "incidentLocation": { "latitude": 23.1650, "longitude": 72.6500 },
+    "incidentType": "MECHANICAL_BREAKDOWN",
+    "description": "Flat tire; vehicle immobilized"
+  }
+  ```
+- **State Transition:** Sets trip `'INTERRUPTED'`. Captures immutable onboard manifest snapshot in `trip_incidents`. Triggers replacement driver dispatch in BullMQ.
+
+---
+
+### Area 22: Replacement Driver Dispatch
+
+#### 22.1 Replacement Driver Accepts Handover
+- **Method & Path:** `POST /api/v1/trips/:id/replacement-offers/:offerId/accept`
+- **Auth:** Bearer Token (`DRIVER`)
+- **Headers:** `Idempotency-Key: <uuid>`
+- **State Transition:** Creates `replacement_driver_assignments`. Updates `active_driver_id`. Applies 10% fare discount to onboard passengers. Trip returns to `'IN_PROGRESS'`. Emits `trip.resumed`.
+
+#### 22.2 Replacement Driver Rejects Handover
+- **Method & Path:** `POST /api/v1/trips/:id/replacement-offers/:offerId/reject`
+- **Auth:** Bearer Token (`DRIVER`)
+- **State Transition:** Cascades offer to next eligible replacement driver.
+
+---
+
+### Area 23: Refunds and Disruptions
+
+#### 23.1 Get Trip Adjustments and Discounts
+- **Method & Path:** `GET /api/v1/trips/:id/adjustments`
+- **Auth:** Bearer Token (Passenger or Driver on Trip)
+
+#### 23.2 Admin: Issue Emergency Full Refund
+- **Method & Path:** `POST /api/v1/admin/refunds`
+- **Auth:** Bearer Token (`ADMIN`)
+
+---
+
+### Area 24: Administration and Fleet Operations
+
+#### 24.1 Get Fleet Overview Statistics
+- **Method & Path:** `GET /api/v1/admin/stats`
+- **Auth:** Bearer Token (`ADMIN`)
+- **Response (200 OK):** Active vehicles, online drivers, completed trips, cash collected today.
+
+#### 24.2 List Active Trips
+- **Method & Path:** `GET /api/v1/admin/trips/active`
+- **Auth:** Bearer Token (`ADMIN`)
+
+#### 24.3 Get Administrative Audit Logs
+- **Method & Path:** `GET /api/v1/admin/audit-logs`
+- **Auth:** Bearer Token (`ADMIN`)
+
+---
+
+### Area 25: Reconnection and Synchronization
+
+#### 25.1 Reconnection State Synchronization
+- **Method & Path:** `POST /api/v1/sync`
+- **Auth:** Bearer Token (Any Role)
+- **Request Body:**
+  ```json
+  {
+    "lastKnownEntityVersion": 4,
+    "activeBookingId": "uuid",
+    "activeTripId": "uuid"
+  }
+  ```
+- **Response (200 OK):** Returns authoritative current state of all user entities, reconciling any missed Socket.IO events.
+
+---
+
+*End of REST and Realtime API Specification*
